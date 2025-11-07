@@ -313,8 +313,8 @@ if load_msgs:
 # ----------------------------
 # Tabs for workflow
 # ----------------------------
-tab_upload, tab_timeseries, tab_bias, tab_freq, tab_cdfdemo, tab_downloads = st.tabs(
-    ["Upload & overview", "Time series", "Bias correction (QDM/LS)", "Freq. distributions", "CDF delta demo", "Downloads"]
+tab_upload, tab_timeseries, tab_bias, tab_freq, tab_cdfdemo = st.tabs(
+    ["Upload & overview", "Time series", "Bias correction (QDM/LS)", "Freq. distributions", "CDF delta demo"]
 )  # organize content with tabs per docs [web:56]
 
 with tab_upload:
@@ -430,20 +430,30 @@ with tab_bias:
     if obs_df is None or hist_df is None or obs_df.empty or hist_df.empty:
         st.error("Upload Observed and Historical files to run this section.")
     else:
-        # 1) Bring your functions verbatim
         import numpy as np
         import pandas as pd
         import matplotlib.pyplot as plt
         from scipy.stats import rankdata
         from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
 
-        def quantile_delta_mapping(obs_hist, mod_hist, mod_fut, obs_fut):
+        def quantile_delta_mapping(obs_hist, mod_hist, mod_fut, obs_fut,
+                                   kind='multiplicative', max_ratio=4.0, clip_quantile=0.99):
+            """
+            Bias-correct future model data using Quantile Delta Mapping (QDM).
+            obs_hist : 1D array of observed values (historical)
+            mod_hist : 1D array of model historical values
+            mod_fut  : 1D array of model future values
+            obs_fut  : 1D array of observed future values (for diagnostics)
+            kind : 'multiplicative' or 'additive'
+            max_ratio : upper cap on multiplicative ratio
+            clip_quantile : upper quantile for capping corrected values
+            """
             n_f = len(mod_fut)
             jitter = np.random.uniform(0, 1e-6, size=n_f)
             mod_fut_j = mod_fut + jitter
             ranks = rankdata(mod_fut_j)
-            tau_f = (ranks - 0.5) / n_f
-            # NumPy API compatibility shim
+            tau_f = (ranks - 0.5) / float(n_f)
+
             try:
                 mod_hist_q = np.quantile(mod_hist, tau_f, method='linear')
                 obs_hist_q = np.quantile(obs_hist, tau_f, method='linear')
@@ -451,37 +461,33 @@ with tab_bias:
                 mod_hist_q = np.quantile(mod_hist, tau_f, interpolation='linear')
                 obs_hist_q = np.quantile(obs_hist, tau_f, interpolation='linear')
 
-            corrected = np.zeros(n_f)
+            corrected = np.zeros(n_f, dtype=float)
             threshold = 1e-6
-            multiplicative = mod_hist_q > threshold
-            delta_m = mod_fut[multiplicative] / mod_hist_q[multiplicative]
-            corrected[multiplicative] = obs_hist_q[multiplicative] * delta_m
 
-            additive = ~multiplicative
-            delta_a = mod_fut[additive] - mod_hist_q[additive]
-            corrected[additive] = obs_hist_q[additive] + delta_a
+            if kind == 'multiplicative':
+                multiplicative = mod_hist_q > threshold
+                ratio = np.ones(n_f, dtype=float)
+                ratio[multiplicative] = mod_fut[multiplicative] / mod_hist_q[multiplicative]
+                # Clip the ratio to prevent runaway
+                ratio[multiplicative] = np.minimum(ratio[multiplicative], max_ratio)
+                corrected[multiplicative] = obs_hist_q[multiplicative] * ratio[multiplicative]
 
-            corrected[corrected < 0] = 0
-            max_threshold = min(np.percentile(obs_fut, 98), 50.0)
-            outlier_mask = corrected > max_threshold
-            corrected[outlier_mask] = max_threshold
-            st.text(f"Number of outliers capped (> {max_threshold:.2f} mm): {np.sum(outlier_mask)}")
+                additive = ~multiplicative
+                delta_a = mod_fut[additive] - mod_hist_q[additive]
+                corrected[additive] = obs_hist_q[additive] + delta_a
+            else:
+                delta = mod_fut - mod_hist_q
+                corrected = obs_hist_q + delta
 
-            zero_prop_obs = np.mean(obs_fut == 0)
-            zero_prop_corrected = np.mean(corrected == 0)
-            if zero_prop_corrected > zero_prop_obs:
-                n_zeros_to_remove = int((zero_prop_corrected - zero_prop_obs) * n_f)
-                zero_indices = np.where(corrected == 0)[0]
-                if len(zero_indices) > 0:
-                    indices_to_change = np.random.choice(zero_indices, size=min(n_zeros_to_remove, len(zero_indices)), replace=False)
-                    min_nonzero = np.min(obs_hist[obs_hist > 0]) if np.any(obs_hist > 0) else 0.1
-                    corrected[indices_to_change] = min_nonzero
-            elif zero_prop_corrected < zero_prop_obs:
-                n_zeros_to_add = int((zero_prop_obs - zero_prop_corrected) * n_f)
-                non_zero_indices = np.where(corrected > 0)[0]
-                if len(non_zero_indices) > 0:
-                    indices_to_zero = np.random.choice(non_zero_indices, size=min(n_zeros_to_add, len(non_zero_indices)), replace=False)
-                    corrected[indices_to_zero] = 0
+            corrected[corrected < 0] = 0.0
+
+            # Cap extremes based on observed future percentiles
+            cap_value = np.percentile(obs_fut, clip_quantile * 100.0)
+            outlier_mask = corrected > cap_value
+            if np.any(outlier_mask):
+                st.text(f"QDM: capping {np.sum(outlier_mask)} values above {cap_value:.2f}")
+                corrected[outlier_mask] = cap_value
+
             return corrected
 
         def linear_scaling(obs_hist, mod_hist, mod_fut):
@@ -490,30 +496,23 @@ with tab_bias:
             corrected[corrected < 0] = 0
             return corrected
 
-        # 2) Recreate your reading and alignment logic inside the app using the already loaded dataframes
-        # The provided files have a sheet named 'observeddata' for observed and a plain two-column layout for historical [observeddata].
-        # Here, obs_df and hist_df are already normalized with Date (datetime64[ns]) and pr (float) columns.
+        # Reading & alignment logic
         obs_work = obs_df.copy()
         mod_work = hist_df.copy()
 
-        # Optional: let users override sheet names in sidebar in the main app; here we proceed with normalized frames.
-        # Ensure same length for the scripted split demo: align on inner join
         merged = obs_work.merge(mod_work, on="Date", how="inner", suffixes=("_obs", "_mod"))
         if merged.empty:
             st.error("No overlapping dates between Observed and Historical; please adjust inputs/date ranges.")
         else:
-            # Restore your script’s variable names
             obs_df_local = merged[["Date", "pr_obs"]].rename(columns={"pr_obs": "pr"})
             mod_df_local = merged[["Date", "pr_mod"]].rename(columns={"pr_mod": "pr"})
 
-            # Your script expects these columns
             obs_df_local["datetime"] = obs_df_local["Date"]
             mod_df_local["datetime"] = mod_df_local["Date"]
 
             obs_pr = obs_df_local["pr"].values
             mod_pr = mod_df_local["pr"].values
 
-            # Split midpoint
             n = len(obs_pr)
             split_idx = n // 2
             hist_period = slice(0, split_idx)
@@ -524,18 +523,18 @@ with tab_bias:
             mod_fut = mod_pr[fut_period]
             obs_fut = obs_pr[fut_period]
 
-            # Run QDM and Linear Scaling per your code
-            corrected_fut_qdm = quantile_delta_mapping(obs_hist, mod_hist, mod_fut, obs_fut)
+            corrected_fut_qdm = quantile_delta_mapping(obs_hist, mod_hist, mod_fut, obs_fut,
+                                                        kind='multiplicative', max_ratio=4.0, clip_quantile=0.99)
             corrected_fut_linear = linear_scaling(obs_hist, mod_hist, mod_fut)
 
             # Metrics
-            r2_qdm = r2_score(obs_fut, corrected_fut_qdm) if len(obs_fut) and len(corrected_fut_qdm) else np.nan
-            mae_qdm = mean_absolute_error(obs_fut, corrected_fut_qdm) if len(obs_fut) and len(corrected_fut_qdm) else np.nan
-            rmse_qdm = np.sqrt(mean_squared_error(obs_fut, corrected_fut_qdm)) if len(obs_fut) and len(corrected_fut_qdm) else np.nan
+            r2_qdm = r2_score(obs_fut, corrected_fut_qdm) if len(obs_fut) else np.nan
+            mae_qdm = mean_absolute_error(obs_fut, corrected_fut_qdm) if len(obs_fut) else np.nan
+            rmse_qdm = np.sqrt(mean_squared_error(obs_fut, corrected_fut_qdm)) if len(obs_fut) else np.nan
 
-            r2_linear = r2_score(obs_fut, corrected_fut_linear) if len(obs_fut) and len(corrected_fut_linear) else np.nan
-            mae_linear = mean_absolute_error(obs_fut, corrected_fut_linear) if len(obs_fut) and len(corrected_fut_linear) else np.nan
-            rmse_linear = np.sqrt(mean_squared_error(obs_fut, corrected_fut_linear)) if len(obs_fut) and len(corrected_fut_linear) else np.nan
+            r2_linear = r2_score(obs_fut, corrected_fut_linear) if len(obs_fut) else np.nan
+            mae_linear = mean_absolute_error(obs_fut, corrected_fut_linear) if len(obs_fut) else np.nan
+            rmse_linear = np.sqrt(mean_squared_error(obs_fut, corrected_fut_linear)) if len(obs_fut) else np.nan
 
             st.markdown("#### QDM Metrics")
             st.text(f"R-squared (corrected vs observed future): {r2_qdm:.4f}")
@@ -547,26 +546,24 @@ with tab_bias:
             st.text(f"Mean Absolute Error (MAE): {mae_linear:.4f}")
             st.text(f"Root Mean Squared Error (RMSE): {rmse_linear:.4f}")
 
-            # Scaling factors and variance ratios
             scaling_factor_raw = np.mean(mod_fut) / np.mean(obs_fut) if np.mean(obs_fut) > 0 else np.nan
-            scaling_factor_corrected_qdm = np.mean(corrected_fut_qdm) / np.mean(obs_fut) if np.mean(obs_fut) > 0 else np.nan
-            scaling_factor_corrected_linear = np.mean(corrected_fut_linear) / np.mean(obs_fut) if np.mean(obs_fut) > 0 else np.nan
+            scaling_factor_qdm = np.mean(corrected_fut_qdm) / np.mean(obs_fut) if np.mean(obs_fut) > 0 else np.nan
+            scaling_factor_linear = np.mean(corrected_fut_linear) / np.mean(obs_fut) if np.mean(obs_fut) > 0 else np.nan
 
             st.markdown("#### Scaling Factors")
             st.text(f"Scaling factor (raw model / obs): {scaling_factor_raw:.4f}")
-            st.text(f"Scaling factor (corrected QDM / obs): {scaling_factor_corrected_qdm:.4f}")
-            st.text(f"Scaling factor (corrected linear / obs): {scaling_factor_corrected_linear:.4f}")
+            st.text(f"Scaling factor (corrected QDM / obs): {scaling_factor_qdm:.4f}")
+            st.text(f"Scaling factor (corrected linear / obs): {scaling_factor_linear:.4f}")
 
             variance_ratio_raw = np.var(mod_fut) / np.var(obs_fut) if np.var(obs_fut) > 0 else np.nan
-            variance_ratio_corrected_qdm = np.var(corrected_fut_qdm) / np.var(obs_fut) if np.var(obs_fut) > 0 else np.nan
-            variance_ratio_corrected_linear = np.var(corrected_fut_linear) / np.var(obs_fut) if np.var(obs_fut) > 0 else np.nan
+            variance_ratio_qdm = np.var(corrected_fut_qdm) / np.var(obs_fut) if np.var(obs_fut) > 0 else np.nan
+            variance_ratio_linear = np.var(corrected_fut_linear) / np.var(obs_fut) if np.var(obs_fut) > 0 else np.nan
 
             st.markdown("#### Variance Ratios")
             st.text(f"Variance ratio (raw model / obs): {variance_ratio_raw:.4f}")
-            st.text(f"Variance ratio (corrected QDM / obs): {variance_ratio_corrected_qdm:.4f}")
-            st.text(f"Variance ratio (corrected linear / obs): {variance_ratio_corrected_linear:.4f}")
+            st.text(f"Variance ratio (corrected QDM / obs): {variance_ratio_qdm:.4f}")
+            st.text(f"Variance ratio (corrected linear / obs): {variance_ratio_linear:.4f}")
 
-            # Residuals
             residuals_qdm = obs_fut - corrected_fut_qdm
             residuals_linear = obs_fut - corrected_fut_linear
 
@@ -587,20 +584,18 @@ with tab_bias:
             st.text(f"Max corrected_fut_linear: {np.max(corrected_fut_linear):.4f}")
 
             st.markdown("#### Residual Quantiles (QDM)")
-            st.text(f"Min: {np.min(residuals_qdm):.4f}, 25th: {np.percentile(residuals_qdm, 25):.4f}, "
-                    f"Median: {np.median(residuals_qdm):.4f}, 75th: {np.percentile(residuals_qdm, 75):.4f}, "
-                    f"Max: {np.max(residuals_qdm):.4f}")
+            st.text(f"Min: {np.min(residuals_qdm):.4f}, 25th: {np.percentile(residuals_qdm,25):.4f}, "
+                    f"Median: {np.median(residuals_qdm):.4f}, 75th: {np.percentile(residuals_qdm,75):.4f}, Max: {np.max(residuals_qdm):.4f}")
 
             st.markdown("#### Residual Quantiles (Linear)")
-            st.text(f"Min: {np.min(residuals_linear):.4f}, 25th: {np.percentile(residuals_linear, 25):.4f}, "
-                    f"Median: {np.median(residuals_linear):.4f}, 75th: {np.percentile(residuals_linear, 75):.4f}, "
-                    f"Max: {np.max(residuals_linear):.4f}")
+            st.text(f"Min: {np.min(residuals_linear):.4f}, 25th: {np.percentile(residuals_linear,25):.4f}, "
+                    f"Median: {np.median(residuals_linear):.4f}, 75th: {np.percentile(residuals_linear,75):.4f}, Max: {np.max(residuals_linear):.4f}")
 
-            # 3) Plotting within Streamlit (use st.pyplot instead of plt.show and avoid saving to disk)
+            # Plotting
             fut_dates = obs_df_local["datetime"].values[fut_period]
 
             st.markdown("#### Time series (future period)")
-            fig1, ax1 = plt.subplots(figsize=(10, 4))
+            fig1, ax1 = plt.subplots(figsize=(10,4))
             ax1.plot(fut_dates, obs_fut, label='Observed', alpha=0.7)
             ax1.plot(fut_dates, mod_fut, label='Raw Model', alpha=0.7)
             ax1.plot(fut_dates, corrected_fut_qdm, label='Corrected (QDM)', alpha=0.7)
@@ -616,7 +611,7 @@ with tab_bias:
             sorted_mod = np.sort(mod_fut)
             sorted_cor_qdm = np.sort(corrected_fut_qdm)
             sorted_cor_linear = np.sort(corrected_fut_linear)
-            fig2, ax2 = plt.subplots(figsize=(6, 6))
+            fig2, ax2 = plt.subplots(figsize=(6,6))
             ax2.scatter(sorted_obs, sorted_mod, label='Raw Model', alpha=0.5)
             ax2.scatter(sorted_obs, sorted_cor_qdm, label='Corrected (QDM)', alpha=0.5)
             ax2.scatter(sorted_obs, sorted_cor_linear, label='Corrected (Linear)', alpha=0.5)
@@ -629,7 +624,7 @@ with tab_bias:
             st.pyplot(fig2)
 
             st.markdown("#### Distribution of All Precipitation Data")
-            fig3, ax3 = plt.subplots(figsize=(10, 4))
+            fig3, ax3 = plt.subplots(figsize=(10,4))
             ax3.hist(obs_hist, bins=50, alpha=0.3, label='Obs Hist', density=True)
             ax3.hist(mod_hist, bins=50, alpha=0.3, label='Mod Hist', density=True)
             ax3.hist(obs_fut, bins=50, alpha=0.3, label='Obs Fut', density=True)
@@ -643,7 +638,7 @@ with tab_bias:
             st.pyplot(fig3)
 
             st.markdown('#### Distribution of Wet Day Precipitation ("Future" Period)')
-            fig4, ax4 = plt.subplots(figsize=(10, 4))
+            fig4, ax4 = plt.subplots(figsize=(10,4))
             ax4.hist(obs_fut[obs_fut > 0], bins=50, alpha=0.5, label='Observed (wet days)', density=True)
             ax4.hist(mod_fut[mod_fut > 0], bins=50, alpha=0.5, label='Raw Model (wet days)', density=True)
             ax4.hist(corrected_fut_qdm[corrected_fut_qdm > 0], bins=50, alpha=0.5, label='Corrected QDM (wet days)', density=True)
@@ -656,7 +651,7 @@ with tab_bias:
             st.pyplot(fig4)
 
             st.markdown("#### Residuals of Corrected vs Observed Precipitation")
-            fig5, ax5 = plt.subplots(figsize=(10, 4))
+            fig5, ax5 = plt.subplots(figsize=(10,4))
             ax5.scatter(fut_dates, residuals_qdm, alpha=0.5, label='QDM Residuals')
             ax5.scatter(fut_dates, residuals_linear, alpha=0.5, label='Linear Residuals')
             ax5.axhline(0, color='red', linestyle='--')
@@ -1029,87 +1024,329 @@ with tab_cdfdemo:
         )
 
 with tab_freq:
-    st.subheader("Frequency distributions and corrections")
+    st.subheader("Frequency distributions and corrections (improved)")
+
     if not (obs_df is not None and hist_df is not None and fut_df is not None):
         st.info("Upload all three files to analyze frequency distributions.")
     else:
-        # Prepare bins across all three datasets
-        max_precip = max(
-            obs_df["pr"].max() if not obs_df.empty else 0,
-            hist_df["pr"].max() if not hist_df.empty else 0,
-            fut_df["pr"].max() if not fut_df.empty else 0
-        )
-        step = st.number_input("Bin step (mm)", min_value=0.1, value=0.1, step=0.1)
-        bins = np.round(np.arange(0.2, max_precip + step, step), 1) if max_precip > 0 else np.array([])
+        import io
+        import numpy as np
+        import pandas as pd
+        import matplotlib.pyplot as plt
+        from sklearn.metrics import r2_score, mean_squared_error
+        from math import ceil
 
-        if bins.size == 0:
-            st.info("Insufficient data to build frequency bins.")
+        # --- Additional imports for xclim+Kappa tail handling ---
+        try:
+            import xarray as xr
+            from xclim import sdba
+            from xclim.sdba import Grouper
+            from scipy.stats import kappa4
+            XC_AVAILABLE = True
+        except Exception:
+            XC_AVAILABLE = False
+
+        # -------------------------
+        # Utilities & best-practice params
+        # -------------------------
+        WET_DAY_THRESHOLD = 0.1        # mm — threshold defining wet day
+        HYBRID_TAIL_QUANTILE = 0.99   # used earlier in freq routines
+        MAX_UPPER_SCALE = 4.0         # safety cap for tail linearization (if used)
+        # Parameters for xclim+Kappa hybrid tail handling
+        TAIL_QUANTILE = 0.99          # above this, use Kappa tail mapping
+        MIN_KAPPA_SAMPLES = 50        # minimum wet-day samples to fit Kappa reliably
+        KAPPA_FIT_WARN = True         # show fit warnings in streamlit
+
+        # Freedman–Diaconis bins
+        def freedman_diaconis_bins(data, minimum_bins=10, fallback_bins=50):
+            data = np.asarray(data)
+            data = data[np.isfinite(data)]
+            if data.size < 2:
+                return fallback_bins
+            q75, q25 = np.percentile(data, [75, 25])
+            iqr = q75 - q25
+            n = data.size
+            if iqr <= 0:
+                return max(minimum_bins, int(ceil(np.sqrt(n))))
+            h = 2 * iqr / (n ** (1/3))
+            if h <= 0:
+                return fallback_bins
+            nbins = int(ceil((data.max() - data.min()) / h))
+            if nbins < minimum_bins:
+                nbins = minimum_bins
+            return nbins
+
+        def prepare_df_with_dates(df: pd.DataFrame) -> pd.DataFrame:
+            d = df.copy()
+            d["Date"] = pd.to_datetime(d["Date"] if "Date" in d.columns else d.get("date"), errors="coerce").dt.floor("D")
+            d = d.sort_values("Date").reset_index(drop=True)
+            d["pr"] = pd.to_numeric(d["pr"], errors="coerce").clip(lower=0)
+            d = d.dropna(subset=["Date"])
+            return d
+
+        obs_df_prep = prepare_df_with_dates(obs_df)
+        hist_df_prep = prepare_df_with_dates(hist_df)
+        fut_df_prep = prepare_df_with_dates(fut_df)
+
+        # -------------------------
+        # Frequency helpers (kept)
+        # -------------------------
+        def compute_frequency_distribution(df: pd.DataFrame, prcol: str, bins_arr: np.ndarray):
+            pr = df[prcol].dropna().values
+            counts, edges = np.histogram(pr, bins=bins_arr)
+            mids = (edges[:-1] + edges[1:]) / 2.0
+            total = counts.sum()
+            freq = counts / total if total > 0 else np.zeros_like(counts, dtype=float)
+            out = pd.DataFrame({
+                "Precipitation (mm)": np.round(mids, 3),
+                "Count": counts,
+                "Frequency": freq
+            })
+            return out
+
+        def correct_frequency_distributions(obs_freq_df, hist_freq_df, bins_edges):
+            obs = obs_freq_df.set_index("Precipitation (mm)")["Frequency"].rename("Frequency_obs")
+            hist = hist_freq_df.set_index("Precipitation (mm)")["Frequency"].rename("Frequency_hist")
+            merged = pd.concat([obs, hist], axis=1).fillna(0)
+
+            # Simple scaling
+            mean_obs = merged["Frequency_obs"].mean()
+            mean_hist = merged["Frequency_hist"].mean() if merged["Frequency_hist"].mean() > 0 else 1.0
+            simple_scaled = merged["Frequency_hist"] * (mean_obs / mean_hist)
+
+            # Variance scaling (heuristic)
+            cdf_hist = np.cumsum(merged["Frequency_hist"].values)
+            cdf_obs = np.cumsum(merged["Frequency_obs"].values)
+            var_obs = merged["Frequency_obs"].var()
+            var_hist = merged["Frequency_hist"].var()
+            if var_hist > 0 and var_obs > 0:
+                scale_v = np.sqrt(var_obs / var_hist)
+                q_idx = np.arange(1, len(cdf_hist)+1) / float(len(cdf_hist))
+                q_idx_scaled = np.clip((q_idx - 0.5) * scale_v + 0.5, 0, 1)
+                interp_obs_cdf = np.interp(q_idx_scaled, q_idx, cdf_obs)
+                pdf_var_scaled = np.diff(np.concatenate(([0.0], interp_obs_cdf)))
+                variance_scaled = pdf_var_scaled if pdf_var_scaled.size == merged.shape[0] else simple_scaled.values
+            else:
+                variance_scaled = simple_scaled.values
+
+            # Quantile-mapping-like redistribution on bins (hybrid)
+            hist_pdf = merged["Frequency_hist"].values
+            obs_pdf = merged["Frequency_obs"].values
+            hist_cdf = np.cumsum(hist_pdf)
+            obs_cdf = np.cumsum(obs_pdf)
+
+            n = len(hist_pdf)
+            qm_pdf = np.zeros_like(hist_pdf)
+            for i in range(n):
+                q_h = hist_cdf[i]
+                target_pos = np.searchsorted(obs_cdf, q_h, side="right")
+                if target_pos <= 0:
+                    target_bin = 0
+                elif target_pos >= n:
+                    target_bin = n-1
+                else:
+                    target_bin = target_pos - 1
+                qm_pdf[target_bin] += hist_pdf[i]
+
+            if qm_pdf.sum() > 0:
+                qm_pdf = qm_pdf / qm_pdf.sum() * merged["Frequency_hist"].sum()
+
+            # Tail smoothing / blending like earlier
+            bin_quantiles = (np.arange(1, n+1) / float(n))
+            tail_mask = bin_quantiles >= HYBRID_TAIL_QUANTILE
+            if tail_mask.any():
+                hist_tail_mean = hist_pdf[tail_mask].mean() if hist_pdf[tail_mask].size else 0
+                obs_tail_mean = obs_pdf[tail_mask].mean() if obs_pdf[tail_mask].size else 0
+                linear_tail = hist_pdf.copy()
+                if hist_tail_mean > 0:
+                    lin_scale = obs_tail_mean / hist_tail_mean if hist_tail_mean > 0 else 1.0
+                    linear_tail[tail_mask] = np.minimum(hist_pdf[tail_mask] * lin_scale,
+                                                         hist_pdf[tail_mask] * MAX_UPPER_SCALE)
+                else:
+                    linear_tail[tail_mask] = qm_pdf[tail_mask]
+                blend_alpha = 0.6
+                final_qm = qm_pdf.copy()
+                final_qm[tail_mask] = blend_alpha * qm_pdf[tail_mask] + (1 - blend_alpha) * linear_tail[tail_mask]
+            else:
+                final_qm = qm_pdf
+
+            final_qm = np.clip(final_qm, 0, None)
+            if final_qm.sum() > 0:
+                final_qm = final_qm / final_qm.sum() * merged["Frequency_hist"].sum()
+
+            out = merged.reset_index().rename(columns={"index": "Precipitation (mm)"})
+            out["Simple_Scaling"] = simple_scaled.values
+            out["Variance_Scaling"] = variance_scaled
+            out["Quantile_Mapping"] = final_qm
+
+            for col in ["Simple_Scaling", "Variance_Scaling", "Quantile_Mapping"]:
+                vals = out[col].values
+                vals = np.clip(vals, 0, None)
+                s = vals.sum()
+                if s > 0:
+                    out[col] = vals / s * out["Frequency_hist"].sum()
+                else:
+                    out[col] = np.zeros_like(vals)
+
+            out["Precipitation (mm)"] = np.round(out["Precipitation (mm)"], 3)
+            return out
+
+        # -------------------------
+        # Compute bins
+        # -------------------------
+        pooled = np.concatenate([
+            obs_df_prep["pr"].values,
+            hist_df_prep["pr"].values,
+            fut_df_prep["pr"].values
+        ])
+        pooled = pooled[np.isfinite(pooled)]
+        wet_only = pooled[pooled > WET_DAY_THRESHOLD]
+        if wet_only.size > 0:
+            nbins = freedman_diaconis_bins(wet_only, minimum_bins=20, fallback_bins=50)
         else:
-            obs_freq = compute_frequency_distribution(obs_df.rename(columns={"pr": "pr_obs"}), "pr_obs", bins)
-            hist_freq = compute_frequency_distribution(hist_df, "pr", bins)
-            fut_freq = compute_frequency_distribution(fut_df, "pr", bins)
+            nbins = 30
+        max_precip = pooled.max() if pooled.size else 0.0
+        if max_precip <= 0:
+            st.info("Insufficient precipitation data to compute frequency distributions.")
+        else:
+            zero_edge = 0.0
+            wet_min = max(WET_DAY_THRESHOLD, 0.001)
+            edges_wet = np.linspace(wet_min, max_precip, nbins)
+            bins_edges = np.concatenate(([0.0, wet_min], edges_wet[1:] if len(edges_wet) > 1 else edges_wet))
 
-            merged_hist_obs = correct_frequency_distributions(obs_freq, hist_freq)
+            obs_freq = compute_frequency_distribution(obs_df_prep.rename(columns={"pr": "pr_obs"}), "pr_obs", bins_edges)
+            hist_freq = compute_frequency_distribution(hist_df_prep, "pr", bins_edges)
+            fut_freq = compute_frequency_distribution(fut_df_prep, "pr", bins_edges)
 
-            # Diagnostics
+            merged_hist_obs = correct_frequency_distributions(obs_freq, hist_freq, bins_edges)
+
+            # Diagnostics (kept)
             st.markdown("#### Diagnostics (Observed vs Historical)")
-            diag_cols = st.columns(2)
-            with diag_cols[0]:
-                st.write("Merged head")
-                st.write(merged_hist_obs.head())
-            with diag_cols[1]:
-                st.write("Stats")
+            c1, c2, c3 = st.columns(3)
+            with c1:
+                st.write("Frequency (head)")
+                st.dataframe(merged_hist_obs.head(12), use_container_width=True)
+            with c2:
+                st.write("Distribution stats")
                 st.write({
-                    "Observed mean": float(merged_hist_obs["Frequency_obs"].mean()),
-                    "Historical mean": float(merged_hist_obs["Frequency_hist"].mean()),
-                    "Observed std": float(merged_hist_obs["Frequency_obs"].std()),
-                    "Historical std": float(merged_hist_obs["Frequency_hist"].std())
+                    "Observed mean (pdf)": float(merged_hist_obs["Frequency_obs"].mean()),
+                    "Historical mean (pdf)": float(merged_hist_obs["Frequency_hist"].mean()),
+                    "Observed std (pdf)": float(merged_hist_obs["Frequency_obs"].std()),
+                    "Historical std (pdf)": float(merged_hist_obs["Frequency_hist"].std())
                 })
+            with c3:
+                st.write("Time-series preview (first 5 rows)")
+                st.write("Observed:")
+                st.write(obs_df_prep[["Date", "pr"]].head())
+                st.write("Historical:")
+                st.write(hist_df_prep[["Date", "pr"]].head())
 
-            # Plots
-            st.markdown("#### Corrected distributions vs Observed")
+            logy = st.checkbox("Log-scale Y axis", value=False, key="freq_logy_final")
+
+            st.markdown("#### Corrected distributions vs Observed (bar charts)")
             for method in ["Simple_Scaling", "Variance_Scaling", "Quantile_Mapping"]:
                 fig, ax = plt.subplots(figsize=(9, 4))
+                width = (bins_edges[1] - bins_edges[0]) * 0.8 if len(bins_edges) > 1 else 0.4
                 ax.bar(merged_hist_obs["Precipitation (mm)"], merged_hist_obs[method],
-                       color="purple", edgecolor="black", width=0.4, alpha=0.7, label=method)
+                       width=width, alpha=0.7, label=method, edgecolor="black")
                 ax.bar(merged_hist_obs["Precipitation (mm)"], merged_hist_obs["Frequency_obs"],
-                       color="royalblue", edgecolor="black", width=0.2, alpha=0.5, label="Observed")
+                       width=width*0.5, alpha=0.5, label="Observed", edgecolor="black")
                 ax.set_xlabel("Precipitation (mm)")
-                ax.set_ylabel("Probability")
+                ax.set_ylabel("Probability (PDF)")
+                if logy:
+                    ax.set_yscale("log")
                 ax.grid(axis="y", linestyle="--", alpha=0.6)
                 ax.legend()
                 st.pyplot(fig)
 
-            # R2 scores
-            st.markdown("#### R² scores (Observed vs corrected Historical)")
-            r2_simple = r2_score(merged_hist_obs["Frequency_obs"], merged_hist_obs["Simple_Scaling"])
-            r2_var = r2_score(merged_hist_obs["Frequency_obs"], merged_hist_obs["Variance_Scaling"])
-            if merged_hist_obs["Quantile_Mapping"].notna().any():
-                r2_qm = r2_score(merged_hist_obs["Frequency_obs"], merged_hist_obs["Quantile_Mapping"])
-            else:
-                r2_qm = np.nan
-            st.write({"R2 Simple": float(r2_simple), "R2 Variance": float(r2_var), "R2 QuantileMap": float(r2_qm) if not np.isnan(r2_qm) else None})
+            def safe_r2_rmse(y_true, y_pred):
+                try:
+                    r2 = r2_score(y_true, y_pred)
+                except:
+                    r2 = np.nan
+                try:
+                    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
+                except:
+                    rmse = np.nan
+                return r2, rmse
 
-            # Apply to future freq
-            fut_corr = apply_fd_to_future(fut_freq, merged_hist_obs)
+            r2_simple, rmse_simple = safe_r2_rmse(merged_hist_obs["Frequency_obs"], merged_hist_obs["Simple_Scaling"])
+            r2_var, rmse_var = safe_r2_rmse(merged_hist_obs["Frequency_obs"], merged_hist_obs["Variance_Scaling"])
+            r2_qm, rmse_qm = safe_r2_rmse(merged_hist_obs["Frequency_obs"], merged_hist_obs["Quantile_Mapping"])
 
-            # Downloads
-            xls_buf_hist = io.BytesIO()
-            with pd.ExcelWriter(xls_buf_hist, engine="xlsxwriter") as writer:
-                merged_hist_obs.to_excel(writer, sheet_name="corrected_hist_freq", index=False)
-            st.download_button("Download corrected Historical frequency (XLSX)",
-                               data=xls_buf_hist.getvalue(),
-                               file_name="corrected_historical_freq.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")  # download_button [web:60]
+            st.markdown("#### Fit scores (Observed PDF vs corrected Historical PDF)")
+            st.write({
+                "R2 Simple": float(r2_simple) if not np.isnan(r2_simple) else None,
+                "RMSE Simple": float(rmse_simple) if not np.isnan(rmse_simple) else None,
+                "R2 Variance": float(r2_var) if not np.isnan(r2_var) else None,
+                "RMSE Variance": float(rmse_var) if not np.isnan(rmse_var) else None,
+                "R2 QuantileMap": float(r2_qm) if not np.isnan(r2_qm) else None,
+                "RMSE QuantileMap": float(rmse_qm) if not np.isnan(rmse_qm) else None
+            })
 
-            xls_buf_fut = io.BytesIO()
-            with pd.ExcelWriter(xls_buf_fut, engine="xlsxwriter") as writer:
-                fut_corr.to_excel(writer, sheet_name="corrected_future_freq", index=False)
-            st.download_button("Download corrected Futuristic frequency (XLSX)",
-                               data=xls_buf_fut.getvalue(),
-                               file_name="corrected_future_freq.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")  # download_button [web:60]
+            # Apply simple scaling to timeseries (kept)
+            obs_mean_freq = merged_hist_obs["Frequency_obs"].mean()
+            hist_mean_freq = merged_hist_obs["Frequency_hist"].mean() if merged_hist_obs["Frequency_hist"].mean() > 0 else 1.0
+            scaling_factor_simple = obs_mean_freq / hist_mean_freq
 
-with tab_downloads:
-    st.subheader("Export options")
-    st.write("Use the download buttons embedded in each tab to export CSV/XLSX outputs.")  # general guidance
+            hist_corrected_simple = hist_df_prep.copy()
+            hist_corrected_simple["pr_simple_scaled"] = hist_corrected_simple["pr"] * scaling_factor_simple
+            fut_corrected_simple = fut_df_prep.copy()
+            fut_corrected_simple["pr_simple_scaled"] = fut_corrected_simple["pr"] * scaling_factor_simple
+
+            # Downloads (kept)
+            hist_out = hist_corrected_simple[["Date", "pr", "pr_simple_scaled"]].copy().rename(columns={"pr":"pr_original"})
+            buf_hist = io.BytesIO()
+            with pd.ExcelWriter(buf_hist, engine="openpyxl") as writer:
+                hist_out.to_excel(writer, sheet_name="corrected_hist_timeseries", index=False)
+            st.download_button("Download corrected Historical time-series (XLSX)",
+                               data=buf_hist.getvalue(),
+                               file_name="corrected_historical_timeseries.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            fut_out = fut_corrected_simple[["Date", "pr", "pr_simple_scaled"]].copy().rename(columns={"pr":"pr_original"})
+            buf_fut = io.BytesIO()
+            with pd.ExcelWriter(buf_fut, engine="openpyxl") as writer:
+                fut_out.to_excel(writer, sheet_name="corrected_future_timeseries", index=False)
+            st.download_button("Download corrected Future time-series (XLSX)",
+                               data=buf_fut.getvalue(),
+                               file_name="corrected_future_timeseries.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+            buf_freq = io.BytesIO()
+            with pd.ExcelWriter(buf_freq, engine="openpyxl") as writer:
+                merged_hist_obs.to_excel(writer, sheet_name="freq_corrections", index=False)
+            st.download_button("Download frequency-correction summary (XLSX)",
+                               data=buf_freq.getvalue(),
+                               file_name="frequency_corrections_summary.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument-spreadsheetml.sheet")
+                        # -------------------------
+            # Combined corrected dataset (Historical + Future)
+            # -------------------------
+            try:
+                combined_corrected = pd.concat([
+                    hist_out.assign(Source="Historical"),
+                    fut_out.assign(Source="Future")
+                ], ignore_index=True)
+
+                # Sort by date (optional, ensures chronological order)
+                combined_corrected = combined_corrected.sort_values("Date").reset_index(drop=True)
+
+                buf_combined = io.BytesIO()
+                with pd.ExcelWriter(buf_combined, engine="openpyxl") as writer:
+                    # Write combined merged data
+                    combined_corrected.to_excel(writer, sheet_name="combined_corrected", index=False)
+                    # Also keep individual sheets for clarity
+                    hist_out.to_excel(writer, sheet_name="historical_corrected", index=False)
+                    fut_out.to_excel(writer, sheet_name="future_corrected", index=False)
+                    merged_hist_obs.to_excel(writer, sheet_name="freq_corrections_summary", index=False)
+
+                st.download_button(
+                    "📘 Download FULL Combined Corrected Data (Historical + Future)",
+                    data=buf_combined.getvalue(),
+                    file_name="combined_corrected_precipitation.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+            except Exception as e:
+                st.warning(f"Error creating combined corrected file: {e}")
+
